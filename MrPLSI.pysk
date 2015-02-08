@@ -1,0 +1,169 @@
+from pyspark import SparkConf, SparkContext, StorageLevel
+
+with open('./config', 'r') as f:
+	master_address = f.read()
+
+conf = SparkConf().setMaster(master_address).setAppName("MrPLSI")
+sc = SparkContext(conf=conf)
+
+import random
+import math
+from datetime import datetime
+import time
+
+random.seed(999)
+
+dataset = "10m"
+L = 128
+max_iter = 1000
+tol = 1e-10
+
+# data = sc.textFile('movie_lens_data/ml-100k/u.data').map(lambda x : map(int, x.split('\t'))) 
+
+if dataset=="100k":
+    data = sc.textFile('movie_lens_data/ml-100k/u.data').map(lambda x : map(int, x.split('\t'))) 
+elif dataset=="1m":
+    data = sc.textFile('movie_lens_data/ml-1m/ratings.dat'
+		).map(lambda x : map(float, x.split('::'))
+		).map(lambda x: [int(x[0]), int(x[1]), x[2], int(x[3])]) 
+elif dataset=="10m":
+    #data = sc.textFile('movie_lens_data/ml-10m/ratings.dat').map(lambda x : map(float, x.split('::')))
+    data = sc.textFile('movie_lens_data/ml-10m/ratings.dat'
+                ).map(lambda x : map(float, x.split('::'))
+                ).map(lambda x: [int(x[0]), int(x[1]), x[2], int(x[3])])
+
+data = data.filter(lambda x : x[2] > 3)
+
+# K > R
+R = 4
+K = 7
+def partition(x, R, K):
+    return K*(x[0]%R) + (x[1]%K)
+
+
+def init_discrete_distribution(size):
+        p = [random.random() for _ in range(size)]
+        sump = sum(p)
+        return [u / sump for u in p]
+
+
+def NormalizedListProduct(a, b):
+	assert len(a) == len(b)
+	prod = [u + v for (u, v) in zip(a,b)]
+	norm = sum(prod)
+	return [p / norm for p in prod]
+
+
+now = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
+def log(line):
+	print '\n\n-------------------------------\n%s\n-------------------------------\n\n' % line
+	log_file = open('logs/MrPLSI_log_%s' % now, 'a')
+	log_file.write('%s\n' % line)
+	log_file.close()
+
+# data is like : user, movie, rating, timestamp
+data = data.map(lambda x : ((x[0], x[1]), x[:-1])
+	).partitionBy(R*K, partitionFunc = lambda x : partition(x, R, K)
+	)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+
+# Init
+N_z_s = data.map(lambda x : x[0][1]
+	).distinct(
+	).map(lambda x : (x, x)
+	).partitionBy(K, partitionFunc = lambda x : x%K
+	).map(lambda x : (x[0], [random.random() for _ in range(L)])
+	)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+
+N_z = N_z_s.map(lambda x : x[1]
+	).reduce(lambda x,y : ([u + v for (u, v) in zip(x, y)]))
+
+p_z_knowing_u = data.map(lambda x : x[0][0]
+        ).distinct(
+        ).map(lambda x : (x, x)
+        ).partitionBy(R, partitionFunc = lambda x : x%R
+        ).map(lambda x : (x[0], init_discrete_distribution(L))
+        )#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+
+p_s_knowing_z = N_z_s.map(lambda x: (x[0], [u/v for (u, v) in zip(x[1], N_z)]))
+cart = p_z_knowing_u.cartesian(p_s_knowing_z
+	)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+
+
+start = time.time()
+## Loop over the following operations :
+loss = float('-inf')
+converged = False
+n_iter = 0
+while not converged and n_iter < max_iter:
+	old_loss = loss
+	#
+	# Q computation
+	q = cart.map(lambda x : (x[0][0], x[1][0], NormalizedListProduct(x[0][1], x[1][1]))
+		)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2) # RDD : [user, item, [z0, z1, z2, ...]]
+	#
+	## Nz_s, N_z and p_z_knowing_u update
+	N_z_s = q.map(lambda x: (x[1], x[2])
+		).reduceByKey(lambda x, y : [u + v for (u, v) in zip(x, y)]
+		)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+	#	
+	N_z = N_z_s.map(lambda x : x[1]
+        ).reduce(lambda x,y : ([u + v for (u, v) in zip(x, y)]))
+	#
+	p_z_knowing_u = q.map(lambda x: (x[0], x[2])
+		).reduceByKey(lambda x, y : ( [u + v for (u, v) in zip(x, y)])
+		).map(lambda x : (x[0], [u / sum(x[1]) for u in x[1]])
+		)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+	#
+	## Loss evaluation
+	p_s_knowing_z = N_z_s.map(lambda x: (x[0], [u/v for (u, v) in zip(x[1], N_z)]))
+	#
+	cart = p_z_knowing_u.cartesian(p_s_knowing_z
+		)#.persist(StorageLevel.MEMORY_AND_DISK_SER_2)
+	#
+	samples, loss = cart.map(lambda x : (1 , math.log(sum([u*v for (u, v) in zip(x[0][1], x[1][1])])))
+		).reduce(lambda x,y : (x[0]+y[0],x[1]+y[1]))
+	#
+	loss = loss/samples
+	assert (loss - old_loss > - tol)
+	converged = math.fabs(loss - old_loss) < tol
+	n_iter += 1
+	log("iteration #%i : loss %.6g  (+%.3g) : %.6g" % (n_iter, loss, loss - old_loss, time.time() - start))
+
+if dataset == '100k':
+	q.saveAsTextFile('movie_lens_results/q_'+dataset+'.txt')
+	N_z_s.saveAsTextFile('movie_lens_results/N_z_s_'+dataset+'.txt')
+	sc.parallelize(N_z).saveAsTextFile('movie_lens_results/N_z_'+dataset+'.txt')
+	p_z_knowing_u.saveAsTextFile('movie_lens_results/p_z_knowing_u_'+dataset+'.txt')
+	p_s_knowing_z.saveAsTextFile('movie_lens_results/p_s_knowing_z_'+dataset+'.txt')
+
+else:
+	movies_columns = ('movie id | movie title | release date | video release date | '
+              'IMDb URL | unknown | Action | Adventure | Animation | '
+              'Children\'s | Comedy | Crime | Documentary | Drama | Fantasy | '
+              'Film-Noir | Horror | Musical | Mystery | Romance | Sci-Fi | '
+              'Thriller | War | Western').replace(' ', '_').split('_|_')
+
+
+	movies = sc.textFile('movie_lens_data/ml-100k/u.item'
+		).map(lambda x : x.split('|')
+		).map(lambda x : (int(x[0]), '%s - %s' % (x[1], ' '.join([movies_columns[i] for i in range(5, len(movies_columns)) if int(x[i]) == 1 ]) )))
+
+	p_s_knowing_z_list = []
+	for i in range(L):
+		p_s_knowing_z_list.append(p_s_knowing_z.map(lambda x : (x[0], x[1][i])
+			).join(movies 
+			).map(lambda x : (x[1][0], x[1][1])
+			).sortByKey(ascending=False
+			).map(lambda x : x[1]))
+
+	n_top_movies = 10
+	output_file = open('logs/topics_results_%i_%s.txt' % (L, now), 'w')
+	for i in range(L):
+        	output_file.write('---------------------------------------\n')
+        	output_file.write('              TOPIC %i \n' % i)
+        	output_file.write('---------------------------------------\n')
+		output_file.write('\n'.join([ s.encode('utf-8') for s in p_s_knowing_z_list[i].take(n_top_movies)]))
+        	output_file.write('\n---------------------------------------\n\n')
+
+	output_file.close()
+
